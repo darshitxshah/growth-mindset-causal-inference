@@ -1,0 +1,405 @@
+---
+title: "Causal Evaluation of Growth Mindset Interventions"
+author: "Darshit Shah"
+output: pdf_document
+---
+
+# Overview
+# This analysis estimates the causal effect of a growth mindset intervention
+#  on student achievement using observational data and modern causal inference
+#   methods.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Step 1: Load Libraries
+
+```{r}
+# Load all required libraries for data analysis and modeling
+library(tidyverse)
+library(MatchIt)
+library(survey)
+library(glmnet)
+library(boot)
+library(broom)
+library(caret)
+library(reshape2)
+```
+
+# Step 2: Load Dataset
+
+```{r}
+# Reading the synthetic dataset
+df <- read_csv("data/college_data.csv") 
+
+# Fix categorical variables 
+df <- df %>%
+  mutate(
+    race = as.factor(race),
+    gender = as.factor(gender),
+    fgen = as.factor(fgen),
+    urban = as.factor(urban),
+    schoolid = as.factor(schoolid)  
+  )
+
+# Converting treatment variable 'z' to an integer (0 = Control, 1 = Treated)
+df <- df %>% mutate(z = as.integer(z))
+
+# Quick peek at the dataset to understand the structure
+glimpse(df)
+
+# Checking for missing values just in case
+colSums(is.na(df))
+```
+
+# Step 3: Basic Data Overview
+
+```{r}
+# View the summary of dataset
+summary(df)
+```
+
+# Step 4: Exploratory Data Analysis (EDA)
+## Outcome and Treatment Distribution
+
+```{r}
+# How are students split across treatment and control
+df %>%
+  ggplot(aes(x = factor(z))) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Treatment Assignment Breakdown", x = "Treatment (0 = Control, 1 = Treated)", y = "Count") +
+  theme_minimal()
+
+# Looking at how the outcome variable or the achievement score is distributed
+df %>%
+  ggplot(aes(x = y)) +
+  geom_histogram(bins = 30, fill = "tomato", color = "black", alpha = 0.7) +
+  geom_density(color = "darkred", size = 1) +
+  labs(title = "Distribution of Achievement Scores", x = "Score", y = "Density") +
+  theme_minimal()
+
+```
+# Heatmap for correlation matrix
+```{r}
+# Checking how numeric variables relate to each other
+num_vars <- df %>% select(where(is.numeric))
+cor_matrix <- cor(num_vars)
+
+cor_melt <- melt(cor_matrix)
+
+ggplot(cor_melt, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "Correlation Heatmap", x = "", y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  coord_fixed()
+
+```
+
+## Top Correlations with Outcome
+
+```{r}
+top_n <- 5
+
+# Selecting only continuous variables for correlation analysis
+selected_vars <- df %>% select(y, selfrpt, mindset, test, sch_race, pov, size)  # Keep only continuous variables
+
+# Compute correlation matrix safely
+cor_matrix <- cor(na.omit(selected_vars))
+
+# Extract the correlation of each variable with the outcome variable 'y'
+cor_with_y <- cor_matrix[, "y"]
+
+# Remove self-correlation line and sort accordingly
+cor_with_y <- cor_with_y[!names(cor_with_y) %in% "y"]
+cor_with_y <- sort(cor_with_y, decreasing = TRUE)[1:top_n]
+
+# Displaying cleaned table
+as.data.frame(cor_with_y) %>%
+  rownames_to_column("Variable") %>%
+  rename(Correlation_with_Y = "cor_with_y") %>%
+  knitr::kable(caption = paste("Top", top_n, "Continuous Covariates Most Correlated with Achievement (Y)"))
+
+
+```
+# Boxplots with Key Covariates
+```{r}
+# selfrpt vs Achievement Score
+df %>% 
+  ggplot(aes(x = selfrpt, y = y)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(title = "Achievement vs Self-Reported Expectations", 
+       x = "Self-Reported Expectation (selfrpt)", 
+       y = "Achievement Score") +
+  theme_minimal()
+
+# mindset vs Achievement Score 
+df %>% 
+  ggplot(aes(x = mindset, y = y)) +
+  geom_point(alpha = 0.5, color = "purple") +
+  geom_smooth(method = "lm", color = "darkviolet") +
+  labs(title = "Achievement vs School Fixed Mindset Level", 
+       x = "School Fixed Mindset (mindset)", 
+       y = "Achievement Score") +
+  theme_minimal()
+
+# gender vs Achievement Score 
+df %>% 
+  ggplot(aes(x = factor(gender), y = y)) +
+  geom_boxplot(fill = "lightgreen") +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Achievement by Gender", 
+       x = "Gender (1 = Female, 2 = Male)", 
+       y = "Achievement Score") +
+  theme_minimal()
+
+# fgen vs Achievement Score 
+df %>% 
+  ggplot(aes(x = factor(fgen), y = y)) +
+  geom_boxplot(fill = "plum") +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(title = "Achievement by First-Gen Status", 
+       x = "First-Generation (1 = Yes, 0 = No)", 
+       y = "Achievement Score") +
+  theme_minimal()
+
+
+
+```
+
+
+
+# Step 5: Covariates vs Treatment Group
+
+```{r}
+# Visualizing how key confounders differ by treatment group
+final_covariates <- c("selfrpt", "mindset")
+
+for (var in final_covariates) {
+  print(
+    df %>%
+      ggplot(aes(x = factor(z), y = .data[[var]], fill = factor(z))) +
+      geom_boxplot() +
+      labs(title = paste(var, "by Treatment Group"), 
+           x = "Treatment (0 = Control, 1 = Treated)", 
+           y = var) +
+      theme_minimal()
+  )
+}
+
+# Categorical variables: gender and fgen (boxplots aren't ideal here, so we use bar plots)
+cat_covariates <- c("gender", "fgen")
+
+for (var in cat_covariates) {
+  print(
+    df %>%
+      ggplot(aes(x = .data[[var]], fill = factor(z))) +
+      geom_bar(position = "dodge") +
+      labs(title = paste("Distribution of", var, "by Treatment Group"), 
+           x = var, 
+           fill = "Treatment Group") +
+      theme_minimal()
+  )
+}
+
+
+```
+
+# Step 6: Propensity Score Modeling
+
+```{r}
+# Final Propensity Score Model using only significant confounders
+ps_model_final <- glm(z ~ selfrpt + gender + fgen + mindset + factor(race), 
+                     data = df, family = binomial)
+
+# Adding predicted propensity scores to the dataframe
+df$pscore <- predict(ps_model_final, type = "response")
+
+# Visualizing Propensity Score Overlap by Treatment Group
+df %>% 
+  ggplot(aes(x = pscore, fill = factor(z))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Propensity Score Distribution by Treatment Group", 
+       x = "Propensity Score", 
+       fill = "Treatment Group") +
+  theme_minimal()
+
+```
+
+# Step 7: Estimating ATE
+
+## IPW - Inverse Probability Weighting
+
+```{r}
+df$ipw_weight <- ifelse(df$z == 1, 1 / df$pscore, 1 / (1 - df$pscore))
+
+library(survey)
+design <- svydesign(ids = ~1, weights = ~ipw_weight, data = df)
+ipw_model <- svyglm(y ~ z, design = design)
+
+summary(ipw_model)
+
+```
+
+## PSM - Propensity Score Matching
+
+```{r}
+matchit_model <- matchit(z ~ selfrpt + gender + fgen + mindset + factor(race),
+                         data = df, method = "nearest")
+
+matched_data <- match.data(matchit_model)
+psm_model <- lm(y ~ z, data = matched_data)
+
+summary(psm_model)
+
+```
+
+## GLM - Covariate Adjusted Regression
+
+```{r}
+# GLM adjusting for covariates
+glm_model <- glm(y ~ z + selfrpt + gender + fgen + mindset + factor(race),
+                 data = df)
+
+summary(glm_model)
+
+```
+
+## AIPW - Augmented Inverse Probability Weighting
+
+```{r}
+outcome_model <- glm(y ~ selfrpt + gender + fgen + mindset + factor(race),
+                     data = df)
+
+df$y_hat <- predict(outcome_model)
+
+df$term1 <- df$z * (df$y - df$y_hat) / df$pscore
+df$term2 <- (1 - df$z) * (df$y - df$y_hat) / (1 - df$pscore)
+
+aipw_ate <- mean(df$term1 - df$term2 + (mean(df$y_hat[df$z == 1]) - mean(df$y_hat[df$z == 0])))
+aipw_ate
+
+```
+
+# Step 8: Visualize ATE Comparisons
+
+```{r}
+# Extract ATE estimates and confidence intervals directly
+
+# IPW
+ipw_ci <- confint(ipw_model)["z", ]
+ipw_est <- coef(ipw_model)["z"]
+
+# PSM
+psm_ci <- confint(psm_model)["z", ]
+psm_est <- coef(psm_model)["z"]
+
+# GLM
+glm_ci <- confint(glm_model)["z", ]
+glm_est <- coef(glm_model)["z"]
+
+# AIPW (For AIPW, we calculated the point estimate manually)
+# Calculate standard error manually if possible or NA if not
+aipw_est <- aipw_ate
+aipw_ci <- c(NA, NA)  
+
+# Creating a dataframe for plotting
+ate_results_ci <- data.frame(
+  Method = c("IPW", "PSM", "GLM", "AIPW"),
+  Estimate = c(ipw_est, psm_est, glm_est, aipw_est),
+  CI_Lower = c(ipw_ci[1], psm_ci[1], glm_ci[1], aipw_ci[1]),
+  CI_Upper = c(ipw_ci[2], psm_ci[2], glm_ci[2], aipw_ci[2])
+)
+
+# Creating bar plot with error bars for confidence intervals
+ggplot(ate_results_ci, aes(x = Method, y = Estimate, fill = Method)) +
+  geom_bar(stat = "identity", color = "black") +
+  
+  # Error bars only for available CIs
+  geom_errorbar(data = subset(ate_results_ci, !is.na(CI_Lower)), 
+                 aes(ymin = CI_Lower, ymax = CI_Upper), 
+                 width = 0.2, size = 1) +
+  
+  # Restore original label alignment
+  geom_text(aes(label = round(Estimate, 3)), 
+             vjust = -0.5, 
+             size = 5) +
+  
+  labs(title = "Estimated ATEs with 95% Confidence Intervals", 
+       y = "Estimated ATE", 
+       x = "Method") +
+  
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+
+```
+
+# Step 9: Diagnostics - Covariate Balance After IPW
+
+```{r}
+# Unweighted density of selfrpt
+df %>%
+  ggplot(aes(x = selfrpt, color = factor(z), fill = factor(z))) +
+  geom_density(alpha = 0.3) +
+  labs(title = "Unweighted Density: Self-Reported Expectations by Treatment",
+       x = "Selfrpt", fill = "Treatment") +
+  theme_minimal()
+
+# Weighted density of selfrpt
+df %>%
+  ggplot(aes(x = selfrpt, weight = ipw_weight, color = factor(z), fill = factor(z))) +
+  geom_density(alpha = 0.3) +
+  labs(title = "IPW-Weighted Density: Self-Reported Expectations by Treatment",
+       x = "Selfrpt", fill = "Treatment") +
+  theme_minimal()
+
+library(tableone)
+library(survey)
+
+# Define the covariates again for balance checking
+covariates <- c("selfrpt", "gender", "fgen", "mindset")
+
+# BEFORE Weighting Table
+table_unweighted <- CreateTableOne(vars = covariates, strata = "z", data = df, test = FALSE)
+print(table_unweighted, smd = TRUE)
+
+# AFTER Weighting [using survey design]
+design_ps <- svydesign(ids = ~1, weights = ~ipw_weight, data = df)
+
+# Create weighted TableOne properly
+table_weighted <- svyCreateTableOne(vars = covariates, strata = "z", data = design_ps, test = FALSE)
+print(table_weighted, smd = TRUE)
+
+```
+
+# Step 10: Limitations:
+
+-Synthetic Data: The analysis used a simulated dataset, which limits how well these results apply to real-world situations.
+
+-Possible Missing Confounders: We assumed that all relevant factors influencing treatment and outcome were included. If we missed any, it could bias our results.
+
+-Sensitivity to Extreme Weights: IPW relies on calculated weights, and very large or small weights can make the estimates less stable.
+
+-Model Assumptions: Both our propensity score model and outcome model assume the correct relationship between variables. Any misspecification here could affect the results.
+
+-SUTVA Assumption: We assumed that the treatment of one student doesn’t affect another (no interference), and that there’s only one version of the treatment applied.
+
+# Step 11: References
+## References:
+1) Yeager, D. S., Hanselman, P., Walton, G. M., et al. (2019).
+  A national experiment reveals where a growth mindset improves achievement.
+  Nature. https://doi.org/10.1038/s41586-019-1466-y
+
+2) Stuart, E. A. (2010).
+  Matching methods for causal inference: A review and a look forward.
+  Statistical Science, 25(1), 1-21.
+
+3) Imbens, G. W., & Rubin, D. B. (2015).
+  Causal Inference in Statistics, Social, and Biomedical Sciences.
+  Cambridge University Press.
+  
